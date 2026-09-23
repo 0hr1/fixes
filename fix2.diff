@@ -1,0 +1,240 @@
+diff --git a/litellm/main.py b/litellm/main.py
+index 7f4b34d28a..5d2e19a09d 100644
+--- a/litellm/main.py
++++ b/litellm/main.py
+@@ -8930,6 +8930,79 @@ def _simple_text_part(choices: Sequence[object]) -> str | None:
+     return content if isinstance(content, str) else ""
+ 
+ 
++def _stream_choice_index(choice: object) -> int:
++    index: Final = choice.get("index", 0) if isinstance(choice, dict) else getattr(choice, "index", 0)
++    return index if isinstance(index, int) else 0
++
++
++def _stream_choice_indices(chunks: Sequence) -> frozenset[int]:
++    return frozenset(_stream_choice_index(choice) for chunk in chunks for choice in chunk.get("choices") or ())
++
++
++def _chunks_narrowed_to_choice(chunks: Sequence, index: int) -> list:  # mutable-ok: stream_chunk_builder takes a list
++    """Every chunk that carries choice ``index``, with its choices narrowed to that one."""
++    narrowed: Final = []  # mutable-ok: see return type
++    for chunk in chunks:
++        choices = [  # mutable-ok: choices is a List field
++            choice for choice in chunk.get("choices") or () if _stream_choice_index(choice) == index
++        ]
++        if not choices:
++            continue
++        narrowed.append(
++            {**chunk, "choices": choices} if isinstance(chunk, dict) else chunk.model_copy(update={"choices": choices})
++        )
++    return narrowed
++
++
++def _stream_chunk_builder_per_choice(
++    processor: ChunkProcessor,
++    choice_indices: frozenset[int],
++    messages: Sequence | None,
++    logging_obj: Optional["Logging"],
++    count_prompt_tokens: Callable[[], int] | None,
++) -> ModelResponse:
++    """An ``n > 1`` stream interleaves several choices (#35793). Each choice index
++    is rebuilt on its own through the single-choice path, then usage and cost are
++    computed once over every chunk, including choice-less usage chunks."""
++    chunks: Final = processor.chunks
++    rebuilt_choices: Final = [  # mutable-ok: choices is a List field
++        cast(
++            ModelResponse,
++            stream_chunk_builder(
++                chunks=_chunks_narrowed_to_choice(chunks, index),
++                count_prompt_tokens=lambda: 0,  # prompt tokens are counted once, below
++            ),
++        )
++        .choices[0]
++        .model_copy(update={"index": index})
++        for index in sorted(choice_indices)
++    ]
++    response: Final = processor.build_base_response(chunks)
++    response.choices = rebuilt_choices
++
++    usage: Final = processor.calculate_usage(
++        chunks=chunks,
++        model=chunks[0]["model"],
++        completion_output=get_content_from_model_response(response),
++        messages=messages,
++        reasoning_tokens=processor.count_reasoning_tokens(response),
++        count_prompt_tokens=count_prompt_tokens,
++    )
++    setattr(response, "usage", usage)
++    for chunk in reversed(chunks):
++        hidden = chunk.get("_hidden_params") if isinstance(chunk, dict) else getattr(chunk, "_hidden_params", None)
++        if isinstance(hidden, dict) and "provider_specific_fields" in hidden:
++            response._hidden_params.setdefault("provider_specific_fields", {}).update(
++                hidden["provider_specific_fields"]
++            )
++            break
++
++    _stamp_streaming_usage_cost(usage, response, logging_obj)
++    _set_stream_builder_response_cost(response, logging_obj)
++    processor.apply_provider_assembled_streaming_metadata(response, chunks, logging_obj)
++    return response
++
++
+ def stream_chunk_builder(
+     chunks: list,
+     messages: Sequence | None = None,
+@@ -8962,6 +9035,10 @@ def stream_chunk_builder(
+         ):  # route to the text completion logic
+             return stream_chunk_builder_text_completion(chunks=chunks, messages=messages)
+ 
++        choice_indices: Final = _stream_choice_indices(chunks)
++        if len(choice_indices) > 1:
++            return _stream_chunk_builder_per_choice(processor, choice_indices, messages, logging_obj, count_prompt_tokens)
++
+         model: Final = chunks[0]["model"]
+         # Initialize the response dictionary
+         response: Final = processor.build_base_response(chunks)
+diff --git a/tests/test_litellm/litellm_core_utils/test_streaming_chunk_builder_utils.py b/tests/test_litellm/litellm_core_utils/test_streaming_chunk_builder_utils.py
+index af763da2d8..51f8c5f083 100644
+--- a/tests/test_litellm/litellm_core_utils/test_streaming_chunk_builder_utils.py
++++ b/tests/test_litellm/litellm_core_utils/test_streaming_chunk_builder_utils.py
+@@ -1329,9 +1329,12 @@ def test_stream_chunk_builder_keeps_each_choices_tool_call_arguments_apart():
+         ]
+     )
+ 
+-    assert [(tool_call.id, tool_call.function.arguments) for tool_call in response.choices[0].message.tool_calls] == [
+-        ("call_a", '{"fruit": "persimmon"}'),
+-        ("call_b", '{"fruit": "durian"}'),
++    assert [
++        [(tool_call.id, tool_call.function.arguments) for tool_call in choice.message.tool_calls]
++        for choice in response.choices
++    ] == [
++        [("call_a", '{"fruit": "persimmon"}')],
++        [("call_b", '{"fruit": "durian"}')],
+     ]
+ 
+ 
+diff --git a/tests/test_litellm/test_main.py b/tests/test_litellm/test_main.py
+index af754e069d..a7bc90cca2 100644
+--- a/tests/test_litellm/test_main.py
++++ b/tests/test_litellm/test_main.py
+@@ -1919,13 +1919,119 @@ def test_stream_chunk_builder_keeps_tool_calls_carried_only_by_a_later_choice_of
+ 
+     response = stream_chunk_builder(chunks=chunks)
+ 
+-    tool_calls = response.choices[0].message.tool_calls
++    assert response.choices[0].message.content == "hello world"
++    tool_calls = response.choices[1].message.tool_calls
+     assert tool_calls is not None
+     assert [(call.id, call.function.name, call.function.arguments) for call in tool_calls] == [
+         ("call_1", "lookup_fruit", '{"fruit":"kiwi"}')
+     ]
+ 
+ 
++def _n2_chunk(
++    index: int,
++    content: str | None = None,
++    finish_reason: str | None = None,
++    role: str | None = None,
++    tool_calls: list | None = None,
++) -> ModelResponseStream:
++    return ModelResponseStream(
++        id="chatcmpl-n2",
++        created=1751934860,
++        model="gpt-4o",
++        object="chat.completion.chunk",
++        choices=[
++            StreamingChoices(
++                index=index,
++                delta=Delta(role=role, content=content, tool_calls=tool_calls),
++                finish_reason=finish_reason,
++            )
++        ],
++    )
++
++
++def test_stream_chunk_builder_keeps_n_greater_than_one_choices_apart():
++    """#35793: an n=2 stream interleaves one choice per chunk; each index must
++    rebuild into its own choice instead of one concatenation of both."""
++    from litellm import stream_chunk_builder
++
++    chunks = [
++        _n2_chunk(0, "AAA", role="assistant"),
++        _n2_chunk(1, "BBB", role="assistant"),
++        _n2_chunk(0, " aaa"),
++        _n2_chunk(1, " bbb"),
++        _n2_chunk(0, finish_reason="stop"),
++        _n2_chunk(1, finish_reason="length"),
++    ]
++
++    response = stream_chunk_builder(chunks=chunks, messages=[{"role": "user", "content": "hi"}])
++
++    assert [(c.index, c.message.content, c.finish_reason) for c in response.choices] == [
++        (0, "AAA aaa", "stop"),
++        (1, "BBB bbb", "length"),
++    ]
++
++
++def test_stream_chunk_builder_keeps_tool_calls_on_their_own_choice_for_n_greater_than_one():
++    from litellm import stream_chunk_builder
++    from litellm.types.utils import ChatCompletionDeltaToolCall, Function
++
++    chunks = [
++        _n2_chunk(0, "hello", role="assistant"),
++        _n2_chunk(
++            1,
++            role="assistant",
++            tool_calls=[
++                ChatCompletionDeltaToolCall(
++                    id="call_1", index=0, type="function", function=Function(name="lookup_fruit", arguments='{"fruit":')
++                )
++            ],
++        ),
++        _n2_chunk(0, " world", finish_reason="stop"),
++        _n2_chunk(
++            1,
++            tool_calls=[ChatCompletionDeltaToolCall(index=0, function=Function(arguments='"kiwi"}'))],
++            finish_reason="tool_calls",
++        ),
++    ]
++
++    response = stream_chunk_builder(chunks=chunks)
++
++    first, second = response.choices
++    assert (first.message.content, first.message.tool_calls, first.finish_reason) == ("hello world", None, "stop")
++    assert second.message.content is None
++    assert second.finish_reason == "tool_calls"
++    assert [(call.id, call.function.name, call.function.arguments) for call in second.message.tool_calls] == [
++        ("call_1", "lookup_fruit", '{"fruit":"kiwi"}')
++    ]
++
++
++def test_stream_chunk_builder_counts_usage_across_all_choices_for_n_greater_than_one():
++    from litellm import stream_chunk_builder
++
++    usage_chunk: Final = ModelResponseStream(
++        id="chatcmpl-n2",
++        created=1751934860,
++        model="gpt-4o",
++        object="chat.completion.chunk",
++        choices=[],
++        usage=Usage(prompt_tokens=7, completion_tokens=11, total_tokens=18),
++    )
++    chunks = [
++        _n2_chunk(0, "AAA", role="assistant"),
++        _n2_chunk(1, "BBB", role="assistant", finish_reason="stop"),
++        _n2_chunk(0, finish_reason="stop"),
++        usage_chunk,
++    ]
++
++    reported = stream_chunk_builder(chunks=chunks)
++    counted = stream_chunk_builder(chunks=chunks[:-1], messages=[{"role": "user", "content": "hi"}])
++
++    assert (reported.usage.prompt_tokens, reported.usage.completion_tokens) == (7, 11)
++    assert counted.usage.completion_tokens == litellm.token_counter(
++        model="gpt-4o", text="AAABBB", count_response_tokens=True
++    )
++
++
+ def test_stream_chunk_builder_thinking_blocks():
+     from litellm import stream_chunk_builder
+     from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices

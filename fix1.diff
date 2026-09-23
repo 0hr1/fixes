@@ -1,0 +1,106 @@
+diff --git a/litellm/litellm_core_utils/prompt_templates/factory.py b/litellm/litellm_core_utils/prompt_templates/factory.py
+index 8424187dcb..d0a83998b9 100644
+--- a/litellm/litellm_core_utils/prompt_templates/factory.py
++++ b/litellm/litellm_core_utils/prompt_templates/factory.py
+@@ -806,7 +806,9 @@ def convert_to_anthropic_image_obj(openai_image_url: str, format: str | None) ->
+         if format:
+             media_type = format
+         else:
+-            media_type = media_type.replace("\\/", "/")
++            # Strip MIME parameters (e.g. ";charset=UTF-8", often copied from an HTTP
++            # Content-Type header); Anthropic only accepts the bare media type.
++            media_type = media_type.replace("\\/", "/").split(";")[0].strip()
+ 
+         return GenericImageParsingChunk(
+             type="base64",
+diff --git a/tests/test_litellm/litellm_core_utils/prompt_templates/test_litellm_core_utils_prompt_templates_factory.py b/tests/test_litellm/litellm_core_utils/prompt_templates/test_litellm_core_utils_prompt_templates_factory.py
+index 4322662cfc..edeeee6845 100644
+--- a/tests/test_litellm/litellm_core_utils/prompt_templates/test_litellm_core_utils_prompt_templates_factory.py
++++ b/tests/test_litellm/litellm_core_utils/prompt_templates/test_litellm_core_utils_prompt_templates_factory.py
+@@ -5,6 +5,7 @@ import re
+ from typing import Final
+ from unittest.mock import MagicMock, patch
+ 
++import httpx
+ import pytest
+ 
+ import litellm
+@@ -18,6 +19,8 @@ from litellm.litellm_core_utils.prompt_templates.factory import (
+     _convert_to_bedrock_tool_call_invoke,
+     _convert_to_bedrock_tool_call_result,
+     anthropic_messages_pt,
++    create_anthropic_image_param,
++    convert_to_anthropic_image_obj,
+     convert_to_anthropic_tool_result,
+     convert_to_gemini_tool_call_result,
+     make_valid_bedrock_tool_name,
+@@ -942,6 +945,69 @@ def test_convert_gemini_tool_call_result_with_data_url_extra_params():
+     ), f"expected clean 'image/png', got '{inline_parts[0]['mime_type']}'"
+ 
+ 
++_TINY_PNG_B64: Final = base64.b64encode(b"PNG_PLACEHOLDER").decode()
++
++
++@pytest.mark.parametrize(
++    "data_url_header",
++    [
++        "data:image/png",
++        "data:image/png;charset=UTF-8",
++        "data:image/png;name=cat.png",
++        "data:image/png; charset=binary",
++    ],
++    ids=["no_params", "charset", "name", "space_before_param"],
++)
++def test_convert_to_anthropic_image_obj_strips_data_url_mime_parameters(data_url_header):
++    """
++    RFC 2397 allows `;key=value` parameters between the MIME type and `;base64`.
++    Anthropic's image `media_type` must be the bare type, so the parameters must
++    not leak into it (e.g. `image/png;charset=UTF-8` is rejected with a 400).
++    """
++    result = convert_to_anthropic_image_obj(f"{data_url_header};base64,{_TINY_PNG_B64}", format=None)
++
++    assert result["media_type"] == "image/png"
++    assert result["data"] == _TINY_PNG_B64
++
++
++def test_convert_to_anthropic_image_obj_explicit_format_overrides_parameterized_mime():
++    result = convert_to_anthropic_image_obj(
++        f"data:application/octet-stream;charset=binary;base64,{_TINY_PNG_B64}", format="image/png"
++    )
++
++    assert result["media_type"] == "image/png"
++    assert result["data"] == _TINY_PNG_B64
++
++
++def test_create_anthropic_image_param_http_url_with_parameterized_content_type(monkeypatch):
++    """
++    LiteLLM downloads http:// images and copies the server's Content-Type into a
++    data URL. A server replying `image/jpeg; charset=binary` must still yield a
++    bare `image/jpeg` media_type on the Anthropic image block.
++    """
++    from litellm.litellm_core_utils.prompt_templates import image_handling
++
++    image_bytes: Final = b"JPEG_PLACEHOLDER"
++    url: Final = "http://example.com/parameterized-content-type.jpg"
++
++    def serve_jpeg(client, request_url, **kwargs):
++        return httpx.Response(
++            200,
++            content=image_bytes,
++            headers={"content-type": "image/jpeg; charset=binary"},
++            request=httpx.Request("GET", request_url),
++        )
++
++    monkeypatch.setattr(image_handling, "safe_get", serve_jpeg)
++    monkeypatch.setattr(image_handling, "in_memory_cache", image_handling.InMemoryCache())
++
++    result = create_anthropic_image_param(url)
++
++    assert result["source"]["type"] == "base64"
++    assert result["source"]["media_type"] == "image/jpeg"
++    assert result["source"]["data"] == base64.b64encode(image_bytes).decode()
++
++
+ def test_bedrock_tools_unpack_defs():
+     """
+     Test that the unpack_defs method handles nested $ref inside anyOf items correctly

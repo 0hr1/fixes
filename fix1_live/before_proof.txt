@@ -1,0 +1,4 @@
+$ curl localhost:4000/v1/chat/completions  (image_url: data:image/png;base64,...)
+  -> OK: 'White'
+$ curl localhost:4000/v1/chat/completions  (image_url: data:image/png;charset=UTF-8;base64,...)
+  -> ERROR 400: litellm.BadRequestError: AnthropicException - {"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.1.image.source.base64.media_type: Input should be 'image/jpeg', 'image/png', 'image/gif' or 'image
